@@ -1,0 +1,126 @@
+#换热端项目涡流对刀配置 https://github.com/cx330-TXY/Simple-Multi-Hotend
+# 寻找中心点: TOOL_EDDY_CALIBRATE TOOL=0 DIR=45,135 REPEATS=1
+# 查询校准结果: GET_TOOL_CENTER TOOL=0
+# 设置工具Z坐标: SET_TOOL_Z TOOL=0 Z=-0.1
+# 清除扫描中心点位置:  CLEAR_TOOL_CENTER TOOL=0
+# 线圈驱动电流校准命令: LDC_CALIBRATE_DRIVE_CURRENT CHIP=calibrator_xy
+# Z 触发使用 [multitool_touch_z]，不占用 [probe]，可与涡流扫床并存
+# 完整校准命令: CALIBRATE_TOOL TOOL=0 / CALIBRATE_ALL_TOOLS
+
+[tool_eddy_calibration calibrator_xy]
+sensor_type: ldc1612
+frequency: 40000000
+reg_drive_current: 22     # 如果使用校准驱动电流命令这个注释
+# max_sensor_hz: 3000000    # 线圈最大频率
+# LDC1612 I2C 配置
+i2c_speed: 400000
+i2c_address: 42           # 地址跳线连接
+i2c_mcu: mcu              # 改成自己的
+i2c_software_scl_pin: mcu:SCL # 改成自己的
+i2c_software_sda_pin: mcu:SDA # 改成自己的
+# PCB线圈位置 大概位置
+coil_x: 183.15  # 改成自己的
+coil_y: 313.94  # 改成自己的
+coil_z: -0.5   # 改成自己的 线圈平面的Z坐标位置
+coil_inner_diameter: 2.0    #线圈内径
+# 扫描参数
+scan_height: 0.4            # 扫描高度, 距离pcb线圈中心点的高度, 以coil_z为基准再次提高的高度, 喷嘴扫描高度距离线圈高度为0.5mm左右
+scan_speed: 4.0             # 扫描速度, 速度低了效果不一定好
+scan_length: 4.0            # 扫描长度, 至少要覆盖线圈内径
+scan_safe_z: 2.0            # 安全Z高度, 比scan_height高就行
+travel_speed_xy: 100.0      # XY旅行速度
+travel_speed_z: 10.0        # Z旅行速度
+save_data: True             # 是否保存探测数据到csv文件
+
+[gcode_macro _TOOL_CALIB_VARS]
+variable_safe_x: 150.0        # 改成自己的 换刀/待机的安全区域X 喷嘴戳热床位置
+variable_safe_y: 150.0        # 改成自己的 换刀/待机的安全区域Y 喷嘴戳热床位置
+variable_safe_z: 5.0         # 改成自己的 换刀/待机的安全区域Z高度
+variable_tool_count: 7       # 改成自己的 工具总数 (例如0, 1，共2个)
+gcode:
+    # 此处无需指令，仅用于存储变量
+
+# ---------------------------------------------------------
+# 校准单个工具
+# 调用示例: CALIBRATE_TOOL TOOL=1
+# ---------------------------------------------------------
+[gcode_macro CALIBRATE_TOOL]
+gcode:
+    {% set tool = params.TOOL|default(0)|int %}
+    {% set vars = printer["gcode_macro _TOOL_CALIB_VARS"] %}
+
+    G1 X{vars.safe_x} Y{vars.safe_y} Z{vars.safe_z} F9000
+    T{tool}
+    SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0
+    G1 X{vars.safe_x} Y{vars.safe_y} Z{vars.safe_z} F9000
+    M109 S150 T{tool}     # 加热到150度
+    # CLEAN_NOZZLE # 看情况自己设置磨嘴, 要不然不准
+    # 清除上次的中心点/Z 结果，避免旧数据影响本次校准
+    CLEAR_TOOL_CENTER TOOL={tool}
+    # 使用独立微动/压力热床 pin 得到喷嘴接触 Z，并同步给 tool_eddy_calibration
+    TOUCH_Z_CALIBRATE_TOOL TOOL={tool} CHANGE_TOOL=0 SAVE=0 UPDATE_EDDY=1 SAMPLES=5
+    G1 X{vars.safe_x} Y{vars.safe_y} Z{vars.safe_z} F9000
+    DO_CALIBRATE_TOOL TOOL={tool}
+    _DO_SAVE_CALIB_RESULT TOOL={tool}
+    M109 S0 T{tool}     # 加热到150度
+    M400   # 【关键】等待动作走完
+    G90
+
+[gcode_macro DO_CALIBRATE_TOOL]
+gcode:
+    {% set tool = params.TOOL|default(0)|int %}
+    # TOUCH_Z_CALIBRATE_TOOL 已经通过 UPDATE_EDDY=1 执行 SET_TOOL_Z。
+    {% set eddy = printer["tool_eddy_calibration calibrator_xy"] %}
+    {% set tool_key = tool|string %}
+    {% if tool_key not in eddy %}
+      {action_raise_error("T" ~ tool ~ " 缺少 touch Z 结果，请先执行 TOUCH_Z_CALIBRATE_TOOL")}
+    {% endif %}
+    {% if tool != 0 and '0' not in eddy %}
+      {action_raise_error("请先执行 CALIBRATE_TOOL TOOL=0 建立 Z/XY 基准")}
+    {% endif %}
+    {% set touchZ = eddy[tool_key].z %}
+    {% set tool0TouchZ = eddy["0"].z if '0' in eddy else touchZ %}
+    # 进行XY偏移校准, 设置一个相对于tool0的z偏移, 避免喷嘴碰到线圈
+    TOOL_EDDY_CALIBRATE TOOL={tool} DIR=0,90 PAIR_CANCEL=0 SCAN_HEIGHT_OFFSET={touchZ-tool0TouchZ}
+
+[gcode_macro _DO_SAVE_CALIB_RESULT]
+gcode:
+    {% set tool = params.TOOL|int %}
+    {% set res0 = printer["tool_eddy_calibration calibrator_xy"]["0"] %}
+    {% set res = printer["tool_eddy_calibration calibrator_xy"][tool|string] %}
+    
+    {% if tool == 0 %}
+        # T0 永远存 0
+        SAVE_VARIABLE VARIABLE=t0_offset_x VALUE=0.0
+        SAVE_VARIABLE VARIABLE=t0_offset_y VALUE=0.0
+        SAVE_VARIABLE VARIABLE=t0_offset_z VALUE=0.0
+        {action_respond_info("✅ T0 基准点坐标已锁定")}
+    {% else %}
+        # 其他工具存探测结果
+        SAVE_VARIABLE VARIABLE=t{tool}_offset_x VALUE={(res.x-res0.x)|round(4)}
+        SAVE_VARIABLE VARIABLE=t{tool}_offset_y VALUE={(res.y-res0.y)|round(4)}
+        SAVE_VARIABLE VARIABLE=t{tool}_offset_z VALUE={(res.z-res0.z)|round(4)}
+        {action_respond_info("✅ T" ~ tool ~ " 偏移量已自动保存")}
+    {% endif %}
+
+# ---------------------------------------------------------
+# 批量校准所有工具
+# ---------------------------------------------------------
+[gcode_macro CALIBRATE_ALL_TOOLS]
+gcode:
+    {% set vars = printer["gcode_macro _TOOL_CALIB_VARS"] %}
+    {action_respond_info("开始全自动工具校准流程...")}
+    # 全部预加热到150度
+    # {% for t in range(0, vars.tool_count) %}
+    #     M104 S150 T{t}
+    # {% endfor %}
+    # 遍历所有工具 (range(0, N) 生成 0 到 N-1)
+    {% for t in range(0, vars.tool_count) %}
+        CALIBRATE_TOOL TOOL={t} REPEATS=5
+    {% endfor %}
+    # 关闭加热
+    {% for t in range(0, vars.tool_count) %}
+        M104 S0 T{t}
+    {% endfor %}
+    untool
+    {action_respond_info("所有工具校准完毕")}
